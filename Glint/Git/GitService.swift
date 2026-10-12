@@ -489,14 +489,15 @@ struct SSHGitRunner: GitRunner {
     }
 
     /// Quote `cwd` for inclusion as `git -C <quoted>` in the remote command.
+    /// Parameter: remote working directory. Returns one re-parse-safe shell word.
     /// Single-quotes everything EXCEPT a leading `~` (or `~user`) segment,
     /// which is left unquoted so the remote login shell performs tilde
     /// expansion. Bash's default `\w` PS1 prints `~/proj` for the user's home
     /// — keeping that working is the whole point of the carve-out.
     ///
     /// Examples (assuming remote `$HOME=/home/deploy`):
-    ///   `~/proj`         → `~'/proj'`          → `/home/deploy/proj`
-    ///   `~admin/proj`    → `~admin'/proj'`     → admin's `$HOME` + `/proj`
+    ///   `~/proj`         → `~/'proj'`          → `/home/deploy/proj`
+    ///   `~admin/proj`    → `~admin/'proj'`     → admin's `$HOME` + `/proj`
     ///   `~`              → `~`                  → `/home/deploy`
     ///   `/abs/path`      → `'/abs/path'`       → literal
     ///   `/srv/has space` → `'/srv/has space'`  → literal (space safe in quotes)
@@ -525,7 +526,8 @@ struct SSHGitRunner: GitRunner {
         }
         guard safe else { return posixShellQuoted(cwd) }
         guard let slash else { return tildePart }
-        return tildePart + posixShellQuoted(String(cwd[slash...]))
+        // POSIX shells need the first slash unquoted to terminate the tilde prefix.
+        return tildePart + "/" + posixShellQuoted(String(cwd[cwd.index(after: slash)...]))
     }
 
 }

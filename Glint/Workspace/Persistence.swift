@@ -150,7 +150,8 @@ enum Persistence {
     /// `Pane`. Returns re-serialized JSON if a bad pane was removed, nil if
     /// nothing changed or the structure is unrecognizable (so the caller only
     /// retries when there's something to retry with). Lets one bad pane cost
-    /// only that pane instead of the whole file.
+    /// only that pane instead of the whole file. Parameter data is saved JSON;
+    /// the returned repair also removes stale layout/focus references.
     static func stripBadPanes(from data: Data) -> Data? {
         guard var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               var workspaces = root["workspaces"] as? [[String: Any]] else { return nil }
@@ -173,7 +174,17 @@ enum Persistence {
                 }
                 j += 2
             }
-            if kept.count != panes.count { workspaces[i]["panes"] = kept }
+            if kept.count != panes.count {
+                workspaces[i]["panes"] = kept
+                // Workspace's decoder repairs the split trees after pruning;
+                // persist those repaired references along with the registry.
+                if let blob = SafeJSON.data(workspaces[i]),
+                   let workspace = try? pdecoder.decode(Workspace.self, from: blob),
+                   let encoded = try? JSONEncoder().encode(workspace),
+                   let repaired = (try? JSONSerialization.jsonObject(with: encoded)) as? [String: Any] {
+                    workspaces[i] = repaired
+                }
+            }
         }
         guard changed else { return nil }
         root["workspaces"] = workspaces
@@ -186,25 +197,33 @@ enum Persistence {
     /// letting one bad workspace cost only that workspace instead of the whole
     /// file. Returns nil if nothing was dropped, if every workspace is bad
     /// (abstaining lets the caller fall back to a fresh state and preserve the
-    /// original on disk), or if the structure is unrecognizable.
+    /// original on disk), or if the structure is unrecognizable. Parameter data
+    /// is saved JSON; a returned repair selects an existing active survivor.
     static func stripBadWorkspaces(from data: Data) -> Data? {
         guard var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let workspaces = root["workspaces"] as? [Any] else { return nil }
         let wdecoder = JSONDecoder()
         var kept: [Any] = []
+        var decoded: [Workspace] = []
         var dropped = 0
         for ws in workspaces {
             // SafeJSON, not bare data(withJSONObject:): a stray non-JSON leaf
             // or non-finite number throws an NSException (uncatchable by try?).
             let blob = SafeJSON.data(ws) ?? Data()
-            if (try? wdecoder.decode(Workspace.self, from: blob)) != nil {
+            if let workspace = try? wdecoder.decode(Workspace.self, from: blob) {
                 kept.append(ws)
+                decoded.append(workspace)
             } else {
                 dropped += 1
             }
         }
         guard dropped > 0, !kept.isEmpty else { return nil }
         root["workspaces"] = kept
+        if let selected = root["selectedWorkspaceID"] as? String,
+           let id = UUID(uuidString: selected),
+           !decoded.contains(where: { $0.id == id }) {
+            root["selectedWorkspaceID"] = (decoded.first(where: { !$0.archived }) ?? decoded[0]).id.uuidString
+        }
         NSLog("[glint] \(fileName): dropping \(dropped) undecodable workspace(s), keeping \(kept.count)")
         return SafeJSON.data(root)
     }

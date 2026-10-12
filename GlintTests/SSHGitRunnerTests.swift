@@ -84,22 +84,24 @@ final class SSHGitRunnerTests: XCTestCase {
     /// performs tilde expansion against the user's actual `$HOME` — otherwise
     /// `~/proj` would land at a literal directory called `~`. Everything after
     /// the tilde segment is single-quoted so spaces/metachars are still safe.
+    /// Keep the slash outside quotes for POSIX tilde expansion. Parameters: none. Returns nothing; checks wire argv.
     func testCommandArgsPreservesLeadingTildeUnquoted() {
         let a = SSHGitRunner.commandArgs(target: "h", port: nil,
                                          controlPath: "/tmp/x.sock",
                                          cwd: "~/code/api", gitArgs: ["status"])
         let gitIndex = a.firstIndex(of: "git")!
         XCTAssertEqual(a[gitIndex + 1], "-C")
-        XCTAssertEqual(a[gitIndex + 2], "~'/code/api'")
+        XCTAssertEqual(a[gitIndex + 2], "~/'code/api'")
     }
 
     /// `~admin/proj` must expand to admin's home (not the login user's), so the
     /// whole `~admin` prefix stays unquoted as one shell tilde-prefix word.
+    /// Keep the named-user tilde prefix unquoted. Parameters: none. Returns nothing; checks wire argv.
     func testTildeUserPreserved() {
         let a = SSHGitRunner.commandArgs(target: "h", port: nil,
                                          controlPath: "/x", cwd: "~admin/proj", gitArgs: [])
         let gitIndex = a.firstIndex(of: "git")!
-        XCTAssertEqual(a[gitIndex + 2], "~admin'/proj'")
+        XCTAssertEqual(a[gitIndex + 2], "~admin/'proj'")
     }
 
     /// Bare `~` (no slash) means `$HOME` — keep it unquoted with nothing
@@ -142,11 +144,30 @@ final class SSHGitRunnerTests: XCTestCase {
     /// shell tilde-expands them; previously `.` wasn't in the carve-out
     /// allowlist, so the path silently fell through to literal quoting and
     /// every dotted-user Review showed "Not a git repository".
+    /// Preserve a dotted username before the unquoted slash. Parameters: none. Returns nothing; checks wire argv.
     func testTildeDottedUsernamePreserved() {
         let a = SSHGitRunner.commandArgs(target: "h", port: nil,
                                          controlPath: "/x",
                                          cwd: "~admin.user/proj", gitArgs: [])
         let gitIndex = a.firstIndex(of: "git")!
-        XCTAssertEqual(a[gitIndex + 2], "~admin.user'/proj'")
+        XCTAssertEqual(a[gitIndex + 2], "~admin.user/'proj'")
+    }
+
+    /// Execute shell quoting in supported login shells. Parameters: none. Returns nothing; asserts expansion and injection safety.
+    func testTildeExpansionAndSpecialCharactersInLoginShells() throws {
+        let suffix = "has space/a'b;$(printf injected)`printf bad`"
+        let cwd = "~/" + suffix
+        let expected = ProcessInfo.processInfo.environment["HOME"]! + "/" + suffix
+        for shell in ["/bin/bash", "/bin/sh", "/bin/zsh"] {
+            let process = Process(), output = Pipe()
+            process.executableURL = URL(fileURLWithPath: shell)
+            process.arguments = ["-c", "printf '%s' " + SSHGitRunner.quoteRemoteCwd(cwd)]
+            process.standardOutput = output
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0, shell)
+            XCTAssertEqual(String(decoding: data, as: UTF8.self), expected, shell)
+        }
     }
 }

@@ -9,11 +9,220 @@ import XCTest
 /// guarantee.
 final class PersistenceRecoveryTests: XCTestCase {
 
-    private func stateData(workspaces: [Workspace]) throws -> Data {
+    /// Encode a fixture without disk access; workspaces and selection are inputs; returns JSON data.
+    private func stateData(workspaces: [Workspace], selectedWorkspaceID: UUID? = nil) throws -> Data {
         let state = PersistedState(workspaces: workspaces,
-                                   selectedWorkspaceID: nil,
+                                   selectedWorkspaceID: selectedWorkspaceID,
                                    sidebarCollapsed: false)
         return try JSONEncoder().encode(state)
+    }
+
+    /// Corrupt pane values in a fixture; workspace, pane IDs and legacy flag are inputs; returns broken JSON.
+    private func corruptPanes(in workspace: Workspace, ids: Set<PaneID>, legacy: Bool = false) throws -> Data {
+        var root = try XCTUnwrap(JSONSerialization.jsonObject(with: stateData(workspaces: [workspace])) as? [String: Any])
+        var encoded = try XCTUnwrap((root["workspaces"] as? [[String: Any]])?.first)
+        var panes = try XCTUnwrap(encoded["panes"] as? [Any])
+        for index in stride(from: 0, to: panes.count, by: 2) {
+            let keyData = try JSONSerialization.data(withJSONObject: panes[index])
+            if ids.contains(try JSONDecoder().decode(PaneID.self, from: keyData)) {
+                panes[index + 1] = ["__corrupted": true]
+            }
+        }
+        encoded["panes"] = panes
+        if legacy {
+            let tab = try XCTUnwrap((encoded["tabs"] as? [[String: Any]])?.first)
+            encoded["root"] = tab["root"]
+            encoded["focusedPane"] = tab["focusedPane"]
+            encoded.removeValue(forKey: "tabs")
+        }
+        root["workspaces"] = [encoded]
+        return try JSONSerialization.data(withJSONObject: root)
+    }
+
+    /// Build a split fixture; no parameters; returns a workspace with two registered panes.
+    private func splitWorkspace() -> Workspace {
+        var workspace = Workspace.fresh(name: "Split", accentHex: "5E5CE6", symbol: "S")
+        let other = PaneID(value: 1)
+        workspace.panes[other] = Pane(id: other, title: "bash", workingDirectory: "/tmp")
+        workspace.tabs[0].root = .split(direction: .horizontal, ratio: 0.4,
+                                         a: .leaf(PaneID(value: 0)), b: .leaf(other))
+        workspace.nextPaneSeq = 2
+        return workspace
+    }
+
+    /// Recover a broken focused leaf; no parameters; returns no value and asserts the surviving pane is shown.
+    func testStripBadPanesPrunesSplitAndRepairsFocus() throws {
+        let workspace = splitWorkspace()
+        let broken = try corruptPanes(in: workspace, ids: [PaneID(value: 0)])
+        let repaired = try XCTUnwrap(Persistence.stripBadPanes(from: broken))
+        let recovered = try XCTUnwrap(JSONDecoder().decode(PersistedState.self, from: repaired).workspaces.first)
+        XCTAssertEqual(recovered.tabs[0].root.leaves, [PaneID(value: 1)])
+        XCTAssertEqual(recovered.tabs[0].focusedPane, PaneID(value: 1))
+        XCTAssertEqual(recovered.panes[PaneID(value: 1)]?.workingDirectory, "/tmp")
+        let serialized = try XCTUnwrap(JSONSerialization.jsonObject(with: repaired) as? [String: Any])
+        let saved = try XCTUnwrap((serialized["workspaces"] as? [[String: Any]])?.first)
+        let savedTab = try XCTUnwrap((saved["tabs"] as? [[String: Any]])?.first)
+        let savedTree = try XCTUnwrap(savedTab["root"] as? [String: Any])
+        XCTAssertEqual(savedTree["kind"] as? String, "leaf", "the saved repair must remove stale split references")
+    }
+
+    /// Recover a pre-tabs split; no parameters; returns no value and asserts migration has no stale leaves.
+    func testStripBadPanesRepairsLegacySplit() throws {
+        let workspace = splitWorkspace()
+        let broken = try corruptPanes(in: workspace, ids: [PaneID(value: 0)], legacy: true)
+        let repaired = try XCTUnwrap(Persistence.stripBadPanes(from: broken))
+        let recovered = try XCTUnwrap(JSONDecoder().decode(PersistedState.self, from: repaired).workspaces.first)
+        XCTAssertEqual(recovered.tabs[0].root.leaves, [PaneID(value: 1)])
+        XCTAssertEqual(recovered.tabs[0].focusedPane, PaneID(value: 1))
+    }
+
+    /// Recover an entirely broken tab; no parameters; returns no value and asserts a usable fresh terminal remains.
+    func testStripBadPanesReplacesEntirelyBrokenTab() throws {
+        let workspace = splitWorkspace()
+        let broken = try corruptPanes(in: workspace, ids: Set(workspace.panes.keys))
+        let repaired = try XCTUnwrap(Persistence.stripBadPanes(from: broken))
+        let recovered = try XCTUnwrap(JSONDecoder().decode(PersistedState.self, from: repaired).workspaces.first)
+        XCTAssertEqual(recovered.id, workspace.id)
+        XCTAssertEqual(recovered.tabs[0].id, workspace.tabs[0].id)
+        XCTAssertEqual(recovered.panes.count, 1)
+        let leaf = try XCTUnwrap(recovered.tabs[0].root.leaves.first)
+        XCTAssertNotNil(recovered.panes[leaf])
+        XCTAssertEqual(recovered.tabs[0].focusedPane, leaf)
+        XCTAssertGreaterThan(recovered.nextPaneSeq, leaf.value)
+    }
+
+    /// Recover a workspace's only broken terminal; no parameters; returns no value and asserts its replacement is visible.
+    @MainActor
+    func testStripBadPanesReplacesOnlyPaneWithVisibleTerminal() throws {
+        let workspace = Workspace.fresh(name: "Only", accentHex: "5E5CE6", symbol: "O")
+        let broken = try corruptPanes(in: workspace, ids: Set(workspace.panes.keys))
+        let repaired = try XCTUnwrap(Persistence.stripBadPanes(from: broken))
+        let recovered = try XCTUnwrap(JSONDecoder().decode(PersistedState.self, from: repaired).workspaces.first)
+        let pane = recovered.tabs[0].focusedPane
+        XCTAssertEqual(recovered.panes.count, 1)
+        XCTAssertNotNil(recovered.panes[pane])
+        XCTAssertTrue(WorkspaceStore.paneIsVisible(.init(workspace: recovered.id, pane: pane),
+                                                   selectedWorkspaceID: recovered.id, in: recovered))
+    }
+
+    /// Repair a focus pointing into another tab; no parameters; returns no value and asserts focus stays inside its tree.
+    func testDecodeRepairsFocusThatPointsToAnotherTab() throws {
+        var workspace = splitWorkspace()
+        workspace.tabs[0].root = .leaf(PaneID(value: 0))
+        workspace.tabs[0].focusedPane = PaneID(value: 1)
+        workspace.tabs.append(WorkspaceTab(id: TabID(value: 1), name: nil,
+                                          root: .leaf(PaneID(value: 1)), focusedPane: PaneID(value: 1)))
+        workspace.nextTabSeq = 2
+        let recovered = try XCTUnwrap(JSONDecoder().decode(PersistedState.self, from: stateData(workspaces: [workspace])).workspaces.first)
+        XCTAssertEqual(recovered.tabs[0].focusedPane, PaneID(value: 0))
+        XCTAssertEqual(recovered.tabs[1].focusedPane, PaneID(value: 1))
+    }
+
+    /// Reject exhausted IDs during empty-tab recovery; no parameters; returns no value and asserts a decoding error instead of a crash.
+    func testDecodeRejectsExhaustedNextPaneSequence() throws {
+        var workspace = Workspace.fresh(name: "Exhausted", accentHex: "5E5CE6", symbol: "E")
+        workspace.panes = [:]
+        workspace.nextPaneSeq = UInt32.max
+        var decodeError: Error?
+        do {
+            _ = try JSONDecoder().decode(PersistedState.self, from: stateData(workspaces: [workspace]))
+        } catch {
+            decodeError = error
+        }
+        XCTAssertTrue(decodeError is DecodingError)
+    }
+
+    /// Reject a registry whose maximum ID cannot advance; no parameters; returns no value and asserts recovery delegates to quarantine.
+    func testDecodeRejectsExhaustedRegisteredPaneID() throws {
+        for value in [UInt32.max, UInt32.max - 1] {
+            var workspace = Workspace.fresh(name: "Exhausted", accentHex: "5E5CE6", symbol: "E")
+            let id = PaneID(value: value)
+            workspace.panes = [id: Pane(id: id, title: "zsh")]
+            var decodeError: Error?
+            do {
+                _ = try JSONDecoder().decode(PersistedState.self, from: stateData(workspaces: [workspace]))
+            } catch {
+                decodeError = error
+            }
+            XCTAssertTrue(decodeError is DecodingError)
+        }
+    }
+
+    /// Recover one broken tab among several; no parameters; returns no value and asserts healthy tabs remain intact.
+    func testStripBadPanesKeepsHealthyTabAndSelection() throws {
+        var workspace = splitWorkspace()
+        workspace.tabs[0].root = .leaf(PaneID(value: 0))
+        let second = WorkspaceTab(id: TabID(value: 1), name: "Healthy", root: .leaf(PaneID(value: 1)), focusedPane: PaneID(value: 1))
+        workspace.tabs.append(second)
+        workspace.selectedTabID = second.id
+        workspace.nextTabSeq = 2
+        let broken = try corruptPanes(in: workspace, ids: [PaneID(value: 0)])
+        let repaired = try XCTUnwrap(Persistence.stripBadPanes(from: broken))
+        let recovered = try XCTUnwrap(JSONDecoder().decode(PersistedState.self, from: repaired).workspaces.first)
+        XCTAssertEqual(recovered.tabs.count, 2)
+        XCTAssertEqual(recovered.selectedTabID, second.id)
+        XCTAssertEqual(recovered.tabs[1].name, "Healthy")
+        XCTAssertEqual(recovered.tabs[1].root.leaves, [PaneID(value: 1)])
+        XCTAssertEqual(recovered.tabs[1].focusedPane, PaneID(value: 1))
+        XCTAssertNotNil(recovered.panes[recovered.tabs[0].focusedPane])
+    }
+
+    /// Leave healthy state untouched; no parameters; returns no value and asserts no repair rewrite is requested.
+    func testStripBadPanesHealthyDataReturnsNil() throws {
+        let workspace = splitWorkspace()
+        let clean = try stateData(workspaces: [workspace])
+        XCTAssertNil(Persistence.stripBadPanes(from: clean))
+        let recovered = try XCTUnwrap(JSONDecoder().decode(PersistedState.self, from: clean).workspaces.first)
+        XCTAssertEqual(recovered.tabs[0].root.leaves, workspace.tabs[0].root.leaves)
+        XCTAssertEqual(recovered.tabs[0].focusedPane, workspace.tabs[0].focusedPane)
+        XCTAssertEqual(recovered.nextPaneSeq, workspace.nextPaneSeq)
+    }
+
+    /// Repair the selection of a removed workspace; no parameters; returns no value and asserts an active survivor is selected.
+    func testStripBadWorkspacesRepairsRemovedSelection() throws {
+        let doomed = Workspace.fresh(name: "Doomed", accentHex: "5E5CE6", symbol: "D")
+        var archived = Workspace.fresh(name: "Archived", accentHex: "5E5CE6", symbol: "A")
+        archived.archived = true
+        let healthy = Workspace.fresh(name: "Healthy", accentHex: "5E5CE6", symbol: "H")
+        var root = try XCTUnwrap(JSONSerialization.jsonObject(with: stateData(workspaces: [doomed, archived, healthy], selectedWorkspaceID: doomed.id)) as? [String: Any])
+        var workspaces = try XCTUnwrap(root["workspaces"] as? [Any])
+        workspaces[0] = ["__corrupted": true]
+        root["workspaces"] = workspaces
+        let repaired = try XCTUnwrap(Persistence.stripBadWorkspaces(from: JSONSerialization.data(withJSONObject: root)))
+        let recovered = try JSONDecoder().decode(PersistedState.self, from: repaired)
+        XCTAssertEqual(recovered.selectedWorkspaceID, healthy.id)
+        let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: repaired) as? [String: Any])
+        XCTAssertEqual(saved["selectedWorkspaceID"] as? String, healthy.id.uuidString)
+    }
+
+    /// Decode a stale UUID without workspace corruption; no parameters; returns no value and asserts selection falls back.
+    func testDecodeRepairsDanglingWorkspaceSelection() throws {
+        let healthy = Workspace.fresh(name: "Healthy", accentHex: "5E5CE6", symbol: "H")
+        let decoded = try JSONDecoder().decode(PersistedState.self, from: stateData(workspaces: [healthy], selectedWorkspaceID: UUID()))
+        XCTAssertEqual(decoded.selectedWorkspaceID, healthy.id)
+    }
+
+    /// Preserve a valid non-first selection; no parameters; returns no value and asserts the user's choice survives decoding.
+    func testDecodePreservesHealthyWorkspaceSelection() throws {
+        let first = Workspace.fresh(name: "First", accentHex: "5E5CE6", symbol: "F")
+        let selected = Workspace.fresh(name: "Selected", accentHex: "5E5CE6", symbol: "S")
+        let decoded = try JSONDecoder().decode(PersistedState.self, from: stateData(workspaces: [first, selected], selectedWorkspaceID: selected.id))
+        XCTAssertEqual(decoded.selectedWorkspaceID, selected.id)
+    }
+
+    /// Preserve absent selection for launch policy; no parameters; returns no value and asserts nil remains nil.
+    func testDecodePreservesAbsentWorkspaceSelection() throws {
+        let workspace = Workspace.fresh(name: "First", accentHex: "5E5CE6", symbol: "F")
+        let decoded = try JSONDecoder().decode(PersistedState.self, from: stateData(workspaces: [workspace]))
+        XCTAssertNil(decoded.selectedWorkspaceID)
+    }
+
+    /// Recover selection with only archived survivors; no parameters; returns no value and asserts the first survivor is used.
+    func testDecodeDanglingSelectionFallsBackWhenAllArchived() throws {
+        var workspace = Workspace.fresh(name: "Archived", accentHex: "5E5CE6", symbol: "A")
+        workspace.archived = true
+        let decoded = try JSONDecoder().decode(PersistedState.self, from: stateData(workspaces: [workspace], selectedWorkspaceID: UUID()))
+        XCTAssertEqual(decoded.selectedWorkspaceID, workspace.id)
     }
 
     /// Two good workspaces, then one is replaced with a dict missing every

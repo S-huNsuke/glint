@@ -12,19 +12,63 @@ import XCTest
 final class ReviewDiffParsingTests: XCTestCase {
 
     private struct NonLocalDiffRunner: GitRunner {
+        /// Return NUL-delimited fixture output. Parameters: Git args, cwd and timeout. Returns a successful result.
         func run(_ args: [String], cwd: String?, timeout: GitTimeout) async throws -> GitResult {
             if args.contains("--name-status") {
-                return GitResult(exitCode: 0, stdout: "M\tfile.txt\n", stderr: "")
+                return GitResult(exitCode: 0, stdout: "M\0file.txt\0", stderr: "")
             }
             if args.contains("--numstat") {
-                return GitResult(exitCode: 0, stdout: "1\t1\tfile.txt\n", stderr: "")
+                return GitResult(exitCode: 0, stdout: "1\t1\tfile.txt\0", stderr: "")
             }
             return GitResult(exitCode: 0, stdout: "", stderr: "")
         }
 
+        /// Supply empty untracked counts. Parameters: repository and paths. Returns an empty map.
         func countUntrackedAdditions(repo: String, paths: [String]) async -> [String: Int] {
             [:]
         }
+    }
+
+    /// Preserve literal path bytes in NUL records. Parameters: none. Returns nothing; asserts counts and kinds.
+    func testMergeNulRecordsPreservesSpecialFilenames() {
+        let paths = ["中文.txt", "tab\tfile.txt", "line\nfile.txt", "quote\"file.txt"]
+        let names = paths.map { "M\0" + $0 + "\0" }.joined()
+        let nums = paths.map { "2\t1\t" + $0 + "\0" }.joined()
+
+        let changes = GitService.mergeNameNumstat(nameStatus: names, numstat: nums)
+
+        XCTAssertEqual(Set(changes.keys), Set(paths))
+        for path in paths {
+            XCTAssertEqual(changes[path]?.kind, .modified)
+            XCTAssertEqual(changes[path]?.additions, 2)
+            XCTAssertEqual(changes[path]?.deletions, 1)
+        }
+    }
+
+    /// Keep binary and mode-only entries when merging. Parameters: none. Returns nothing; asserts metadata.
+    func testMergeNulRecordsKeepsBinaryAndModeOnlyChanges() {
+        let changes = GitService.mergeNameNumstat(
+            nameStatus: "M\0binary.dat\0M\0mode.txt\0",
+            numstat: "-\t-\tbinary.dat\0")
+
+        XCTAssertEqual(changes.count, 2)
+        XCTAssertEqual(changes["binary.dat"]?.isBinary, true)
+        XCTAssertEqual(changes["binary.dat"]?.additions, 0)
+        XCTAssertEqual(changes["mode.txt"]?.kind, .modified)
+        XCTAssertEqual(changes["mode.txt"]?.deletions, 0)
+    }
+
+    /// Merge rename-as-delete/add records by their actual paths. Parameters: none. Returns nothing; asserts counts.
+    func testMergeNulRecordsKeepsRenameAsDeleteAndAdd() {
+        let changes = GitService.mergeNameNumstat(
+            nameStatus: "D\0old.txt\0A\0new.txt\0",
+            numstat: "0\t3\told.txt\03\t0\tnew.txt\0")
+
+        XCTAssertEqual(Set(changes.keys), ["old.txt", "new.txt"])
+        XCTAssertEqual(changes["old.txt"]?.kind, .deleted)
+        XCTAssertEqual(changes["old.txt"]?.deletions, 3)
+        XCTAssertEqual(changes["new.txt"]?.kind, .added)
+        XCTAssertEqual(changes["new.txt"]?.additions, 3)
     }
 
     private func file(_ path: String) -> GitFileChange {

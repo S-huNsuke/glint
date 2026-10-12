@@ -29,8 +29,9 @@ struct GitFileChange: Identifiable, Equatable {
 
 extension GitService {
 
-    /// Files changed under `scope`, sorted by path. Never throws — a non-repo or
-    /// bad base just yields an empty list (the UI shows "no changes").
+    /// Return files changed in `repo` under `scope`, sorted by literal path.
+    /// Parameters: repository directory and comparison scope. Returns an empty
+    /// list for a non-repository or invalid base; never throws.
     func changedFiles(repo: String, scope: DiffScope) async -> [GitFileChange] {
         switch scope {
         case .workingTree:
@@ -41,9 +42,9 @@ extension GitService {
             // tier it would SIGTERM, drop to `u.ok == false`, and silently
             // omit every untracked file from the Review list (worse than
             // truncation: the entries appear to not exist at all).
-            async let names = git(["diff", "HEAD", "--name-status"], cwd: repo,
+            async let names = git(["diff", "HEAD", "--no-renames", "--name-status", "-z"], cwd: repo,
                                   allowFailure: true, timeout: .read)
-            async let nums  = git(["diff", "HEAD", "--numstat"], cwd: repo,
+            async let nums  = git(["diff", "HEAD", "--no-renames", "--numstat", "-z"], cwd: repo,
                                   allowFailure: true, timeout: .read)
             async let untrk = git(["ls-files", "--others", "--exclude-standard", "-z"], cwd: repo,
                                   allowFailure: true, timeout: .read)
@@ -62,9 +63,9 @@ extension GitService {
             return withMtime(map.values.sorted { $0.path < $1.path }, repo: repo)
 
         case .branch(let base):
-            async let names = git(["diff", "\(base)...HEAD", "--name-status"], cwd: repo,
+            async let names = git(["diff", "\(base)...HEAD", "--no-renames", "--name-status", "-z"], cwd: repo,
                                   allowFailure: true, timeout: .read)
-            async let nums  = git(["diff", "\(base)...HEAD", "--numstat"], cwd: repo,
+            async let nums  = git(["diff", "\(base)...HEAD", "--no-renames", "--numstat", "-z"], cwd: repo,
                                   allowFailure: true, timeout: .read)
             let map = Self.mergeNameNumstat(
                 nameStatus: (try? await names)?.stdout ?? "",
@@ -129,15 +130,16 @@ extension GitService {
 
     // MARK: parsing
 
-    /// Merge `--name-status` (kind per path) with `--numstat` (line counts). No
-    /// `-M`: a rename appears as a delete + add pair, which both commands agree
-    /// on, so keying by path is consistent.
+    /// Merge literal paths from NUL-delimited Git output. Parameters:
+    /// `nameStatus` from `--name-status -z --no-renames` and `numstat` from
+    /// `--numstat -z --no-renames`. Returns changes keyed by their actual paths.
+    /// Explicitly disabling renames keeps delete/add paths aligned even when
+    /// the repository enables rename detection; NUL avoids Git's quoted paths.
     static func mergeNameNumstat(nameStatus: String, numstat: String) -> [String: GitFileChange] {
         var kinds: [String: GitFileChange.Kind] = [:]
-        for line in nameStatus.split(separator: "\n", omittingEmptySubsequences: true) {
-            let parts = line.split(separator: "\t")
-            guard parts.count >= 2 else { continue }
-            let code = String(parts[0]); let path = String(parts[parts.count - 1])
+        var names = nameStatus.split(separator: "\0", omittingEmptySubsequences: true).makeIterator()
+        while let code = names.next(), let rawPath = names.next() {
+            let path = String(rawPath)
             switch code.first {
             case "A": kinds[path] = .added
             case "D": kinds[path] = .deleted
@@ -146,7 +148,7 @@ extension GitService {
             }
         }
         var out: [String: GitFileChange] = [:]
-        for line in numstat.split(separator: "\n", omittingEmptySubsequences: true) {
+        for line in numstat.split(separator: "\0", omittingEmptySubsequences: true) {
             let parts = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
             guard parts.count == 3 else { continue }
             let a = String(parts[0]); let d = String(parts[1]); let path = String(parts[2])
@@ -154,7 +156,7 @@ extension GitService {
             out[path] = GitFileChange(path: path, kind: kinds[path] ?? .modified,
                                       additions: Int(a) ?? 0, deletions: Int(d) ?? 0, isBinary: binary)
         }
-        // Mode-only / rename entries can appear in name-status but not numstat.
+        // Mode-only entries can appear in name-status but not numstat.
         for (path, kind) in kinds where out[path] == nil {
             out[path] = GitFileChange(path: path, kind: kind, additions: 0, deletions: 0, isBinary: false)
         }
