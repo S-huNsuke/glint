@@ -380,6 +380,7 @@ function websocketURL() {
   return `${scheme}//${location.hostname}:${httpPort + 1}/control`;
 }
 
+/** Open a fresh WebSocket session; takes no arguments and returns nothing. */
 function connect() {
   clearTimeout(reconnectTimer);
   if (socket) {
@@ -395,6 +396,7 @@ function connect() {
   const currentSocket = socket;
   socket.binaryType = "arraybuffer";
   socket.addEventListener("open", () => {
+    if (socket !== currentSocket) return;
     lastServerMessageAt = Date.now();
     reconnectDelay = 500;
     // The server issues an auth-challenge as soon as the socket opens; we wait
@@ -406,7 +408,7 @@ function connect() {
     lastServerMessageAt = Date.now();
     const data = event.data;
     if (typeof data === "string") {
-      handleMessage(data);        // plaintext: auth-challenge / handshake error
+      handlePlaintextFrame(data);
     } else {
       onEncryptedFrame(data);     // binary: encrypted frame
     }
@@ -420,7 +422,36 @@ function connect() {
     reconnectTimer = setTimeout(connect, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 1.8, 8000);
   });
-  socket.addEventListener("error", () => setStatus("error", t("unable_connect")));
+  socket.addEventListener("error", () => {
+    if (socket !== currentSocket) return;
+    setStatus("error", t("unable_connect"));
+  });
+}
+
+/** Validate a plaintext handshake frame; takes raw JSON and returns nothing. */
+function handlePlaintextFrame(raw) {
+  if (encrypted || authenticated) {
+    socket?.close();
+    return;
+  }
+  let message;
+  try {
+    message = JSON.parse(raw);
+  } catch {
+    socket?.close();
+    return;
+  }
+  const validChallenge = message?.type === "auth-challenge"
+    && pendingChallenge === null
+    && typeof message.challenge === "string"
+    && /^[A-Za-z0-9+/]{43}=$/.test(message.challenge);
+  const validError = message?.type === "error"
+    && ["unauthorized", "bad-request"].includes(message.code);
+  if (!validChallenge && !validError) {
+    socket?.close();
+    return;
+  }
+  handleMessage(raw);
 }
 
 function reconnectIfStale() {
@@ -465,8 +496,9 @@ function deriveSession(accessKey, challengeB64) {
   return encodeBase64(proof);
 }
 
-/// Send the proof once both the access key and the challenge are known.
+/** Send the handshake proof when ready; takes no arguments and returns nothing. */
 function tryAuthenticate() {
+  if (encrypted || authenticated) return;
   if (!token || !pendingChallenge) return;
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   const proof = deriveSession(token, pendingChallenge);
@@ -511,16 +543,19 @@ function onEncryptedFrame(buffer) {
   handleMessage(json);
 }
 
+/** Send a JSON command without plaintext fallback; takes a message and returns nothing. */
 function send(message) {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   const json = JSON.stringify(message);
   if (encrypted && c2sKey) {
     socket.send(encryptFrame(json));
-  } else {
+  } else if (!encrypted && !authenticated && message.type === "authenticate"
+      && pendingChallenge && c2sKey && s2cKey) {
     socket.send(json);
   }
 }
 
+/** Dispatch validated protocol JSON; takes a JSON string and returns nothing. */
 function handleMessage(raw) {
   let message;
   try {
@@ -530,6 +565,10 @@ function handleMessage(raw) {
   }
   switch (message.type) {
     case "auth-challenge":
+      if (encrypted) {
+        socket?.close();
+        return;
+      }
       pendingChallenge = message.challenge;
       tryAuthenticate();
       break;
@@ -755,8 +794,13 @@ function applyTheme(theme) {
   };
 }
 
+/** Update protocol error UI; takes a server error code and returns nothing. */
 function handleError(code) {
   if (code === "unauthorized") {
+    if (encrypted) {
+      socket?.close();
+      return;
+    }
     authenticated = false;
     updateFilesButton();
     token = "";
