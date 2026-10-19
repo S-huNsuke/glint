@@ -36,6 +36,17 @@
         }
       }
     },
+    "%d of its panes still have something running; archiving will terminate their processes.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "其中 %d 个面板仍有任务在运行，归档将终止这些进程。"
+          }
+        }
+      }
+    },
     "%d of its panes still have something running; everything in this workspace will be terminated.": {
       "extractionState": "stale",
       "localizations": {
@@ -472,6 +483,28 @@
           "stringUnit": {
             "state": "translated",
             "value": "归档"
+          }
+        }
+      }
+    },
+    "Archive Workspace": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "归档工作区"
+          }
+        }
+      }
+    },
+    "Archive “%@”?": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "归档“%@”？"
           }
         }
       }
@@ -6028,6 +6061,28 @@
           "stringUnit": {
             "state": "translated",
             "value": "✗ 名称非法"
+          }
+        }
+      }
+    },
+    "Couldn't load changed files. Try refreshing.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法加载更改文件，请刷新重试。"
+          }
+        }
+      }
+    },
+    "Couldn't load the diff. Try refreshing.": {
+      "extractionState": "manual",
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法加载差异，请刷新重试。"
           }
         }
       }

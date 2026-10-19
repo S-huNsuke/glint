@@ -165,7 +165,11 @@ final class UsageStore: ObservableObject {
         didSet {
             guard claudeEnabled != oldValue else { return }
             UserDefaults.standard.set(claudeEnabled, forKey: Self.claudeKey)
-            if !claudeEnabled { claude = nil; Self.saveQuota(nil, agent: .claude) }
+            if !claudeEnabled {
+                cancelRefresh(for: .claude)
+                claude = nil
+                Self.saveQuota(nil, agent: .claude)
+            }
             syncTimer()
             if claudeEnabled { refreshNow() }
         }
@@ -175,7 +179,8 @@ final class UsageStore: ObservableObject {
             guard codexEnabled != oldValue else { return }
             UserDefaults.standard.set(codexEnabled, forKey: Self.codexKey)
             if !codexEnabled {
-                codexRefreshCoordinator.invalidate()
+                codexHomeRefreshes.values.forEach { $0.task.cancel() }
+                codexHomeRefreshes.removeAll()
                 codex = nil
                 codexHomeStatuses = []
                 Self.saveQuota(nil, agent: .codex)
@@ -188,7 +193,11 @@ final class UsageStore: ObservableObject {
         didSet {
             guard grokEnabled != oldValue else { return }
             UserDefaults.standard.set(grokEnabled, forKey: Self.grokKey)
-            if !grokEnabled { grok = nil; Self.saveQuota(nil, agent: .grok) }
+            if !grokEnabled {
+                cancelRefresh(for: .grok)
+                grok = nil
+                Self.saveQuota(nil, agent: .grok)
+            }
             syncTimer()
             if grokEnabled { refreshNow() }
         }
@@ -198,13 +207,15 @@ final class UsageStore: ObservableObject {
     private static let codexKey = "glint.showCodexUsage"
     private static let grokKey = "glint.showGrokUsage"
     private var timer: Timer?
-    private var codexRefreshCoordinator = CodexRefreshCoordinator()
+    private var agentRefreshes: [Agent: (id: UUID, task: Task<Void, Never>)] = [:]
+    private var codexHomeRefreshes: [URL: (id: UUID, task: Task<Void, Never>)] = [:]
     /// Refresh cadence. Rate-limit windows move on the order of minutes, so a
     /// minute of staleness is invisible and keeps disk/network churn trivial.
     private let interval: TimeInterval = 60
 
     private var anyEnabled: Bool { claudeEnabled || codexEnabled || grokEnabled }
 
+    /// Load enabled agents and cached quotas; takes no arguments and initializes the poller.
     init() {
         self.claudeEnabled = (UserDefaults.standard.object(forKey: Self.claudeKey) as? Bool) ?? false
         self.codexEnabled = (UserDefaults.standard.object(forKey: Self.codexKey) as? Bool) ?? false
@@ -215,15 +226,19 @@ final class UsageStore: ObservableObject {
         if codexEnabled { self.codex = Self.loadQuota(.codex) }
         if grokEnabled { self.grok = Self.loadQuota(.grok) }
         syncTimer()
+        if anyEnabled { refreshNow() }
     }
 
-    deinit { timer?.invalidate() }
+    deinit {
+        timer?.invalidate()
+        agentRefreshes.values.forEach { $0.task.cancel() }
+        codexHomeRefreshes.values.forEach { $0.task.cancel() }
+    }
 
-    /// Start or stop the repeating poll to match whether anything is enabled.
+    /// Start or stop the repeating timer; takes no arguments and returns nothing.
     private func syncTimer() {
         if anyEnabled {
             guard timer == nil else { return }
-            refreshNow()
             let t = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.refreshNow() }
             }
@@ -236,68 +251,87 @@ final class UsageStore: ObservableObject {
         }
     }
 
-    /// Refresh whichever agents are currently enabled and publish results.
+    /// Refresh enabled sources, sharing in-flight requests; takes no arguments and returns nothing.
     func refreshNow() {
-        if codexEnabled {
-            let generation = codexRefreshCoordinator.begin()
-            Task { [weak self] in
-                let homes = CodexHomeStore.configuredHomes().filter(\.isEnabled)
-                await MainActor.run {
-                    guard let self,
-                          self.codexRefreshCoordinator.accepts(generation) else { return }
-                    self.codexHomeStatuses = homes.map {
-                        CodexHomeStatus(
-                            home: $0,
-                            resolvedURL: $0.resolvedURL,
-                            hookStatus: CodexHookInstaller.status(in: $0.resolvedURL),
-                            authStatus: CodexLiveReader.authStatus(from: $0.resolvedURL),
-                            quotaStatus: .loading
-                        )
-                    }
-                }
-                let statuses = await withTaskGroup(of: CodexHomeStatus.self) { group in
-                    for home in homes {
-                        group.addTask {
-                            let quota = await CodexUsageReader.readPreferLive(from: home.resolvedURL)
-                            return CodexHomeStatus(
-                                home: home,
-                                resolvedURL: home.resolvedURL,
-                                hookStatus: CodexHookInstaller.status(in: home.resolvedURL),
-                                authStatus: CodexLiveReader.authStatus(from: home.resolvedURL),
-                                quotaStatus: quota.map(CodexQuotaStatus.available)
-                                    ?? .unavailable(String(localized: "Quota unavailable"))
-                            )
-                        }
-                    }
-                    var byID: [UUID: CodexHomeStatus] = [:]
-                    for await status in group { byID[status.id] = status }
-                    return homes.compactMap { byID[$0.id] }
-                }
-                await MainActor.run {
-                    guard let self,
-                          self.codexRefreshCoordinator.accepts(generation) else { return }
-                    self.applyCodex(statuses)
-                }
-            }
-        }
+        if codexEnabled { refreshCodexHomes() }
         if claudeEnabled {
-            Task { [weak self] in
-                let claude = await ClaudeUsageReader.read()
-                await MainActor.run {
-                    self?.apply(claude, to: .claude)
-                }
-            }
+            refreshAgent(.claude, read: ClaudeUsageReader.read)
         }
         if grokEnabled {
-            Task { [weak self] in
-                let quota = await GrokUsageReader.read()
-                await MainActor.run {
-                    self?.apply(quota, to: .grok)
-                }
-            }
+            refreshAgent(.grok, read: GrokUsageReader.read)
         }
     }
 
+    /// Share one agent read and reject cancelled results; inputs are agent and reader; returns nothing.
+    private func refreshAgent(_ agent: Agent, read: @escaping () async -> AgentQuota?) {
+        guard agentRefreshes[agent] == nil else { return }
+        let id = UUID()
+        let task = Task { [weak self] in
+            let quota = await read()
+            guard !Task.isCancelled, let self, self.agentRefreshes[agent]?.id == id else { return }
+            self.agentRefreshes[agent] = nil
+            self.apply(quota, to: agent)
+        }
+        agentRefreshes[agent] = (id, task)
+    }
+
+    /// Cancel an agent's pending read and invalidate its identity; input is agent; returns nothing.
+    private func cancelRefresh(for agent: Agent) {
+        agentRefreshes.removeValue(forKey: agent)?.task.cancel()
+    }
+
+    /// Reconcile enabled homes and share one read per path; takes no arguments and returns nothing.
+    private func refreshCodexHomes() {
+        let homes = CodexHomeStore.configuredHomes().filter(\.isEnabled)
+        let urls = Set(homes.map(\.resolvedURL))
+        for (url, refresh) in codexHomeRefreshes where !urls.contains(url) {
+            refresh.task.cancel()
+            codexHomeRefreshes[url] = nil
+        }
+        let previous = Dictionary(uniqueKeysWithValues: codexHomeStatuses.map { ($0.resolvedURL, $0) })
+        if !previous.isEmpty && Set(previous.keys) != urls {
+            codex = nil
+            Self.saveQuota(nil, agent: .codex)
+        }
+        applyCodex(homes.map { home in
+            CodexHomeStatus(
+                home: home,
+                resolvedURL: home.resolvedURL,
+                hookStatus: CodexHookInstaller.status(in: home.resolvedURL),
+                authStatus: CodexLiveReader.authStatus(from: home.resolvedURL),
+                quotaStatus: previous[home.resolvedURL]?.quotaStatus ?? .loading
+            )
+        })
+        for home in homes {
+            let url = home.resolvedURL
+            guard codexHomeRefreshes[url] == nil else { continue }
+            let id = UUID()
+            let task = Task { [weak self] in
+                let quota = await CodexUsageReader.readPreferLive(from: url)
+                guard !Task.isCancelled, let self, self.codexHomeRefreshes[url]?.id == id else { return }
+                self.codexHomeRefreshes[url] = nil
+                guard self.codexEnabled,
+                      let currentHome = CodexHomeStore.configuredHomes().first(where: {
+                          $0.isEnabled && $0.resolvedURL == url
+                      }),
+                      let index = self.codexHomeStatuses.firstIndex(where: { $0.resolvedURL == url })
+                else { return }
+                var statuses = self.codexHomeStatuses
+                statuses[index] = CodexHomeStatus(
+                    home: currentHome,
+                    resolvedURL: url,
+                    hookStatus: CodexHookInstaller.status(in: url),
+                    authStatus: CodexLiveReader.authStatus(from: url),
+                    quotaStatus: quota.map(CodexQuotaStatus.available)
+                        ?? .unavailable(String(localized: "Quota unavailable"))
+                )
+                self.applyCodex(statuses)
+            }
+            codexHomeRefreshes[url] = (id, task)
+        }
+    }
+
+    /// Publish the configured homes and their first usable quota; input is statuses; returns nothing.
     private func applyCodex(_ statuses: [CodexHomeStatus]) {
         guard codexEnabled else { return }
         codexHomeStatuses = statuses
@@ -412,6 +446,7 @@ enum CodexUsageReader {
     /// the main actor since it touches the filesystem.
     static func readPreferLive(from codexHome: URL = CodexHome.default.resolvedURL) async -> AgentQuota? {
         if let live = await CodexLiveReader.read(from: codexHome) { return live }
+        guard !Task.isCancelled else { return nil }
         return await Task.detached(priority: .utility) { read(from: codexHome) }.value
     }
 

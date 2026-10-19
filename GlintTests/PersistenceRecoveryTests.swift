@@ -3,11 +3,110 @@ import XCTest
 
 /// Recovery logic in `Persistence.load()` is the only thing standing between a
 /// half-written state.json and losing every workspace. `load()`/`save()` read a
-/// fixed Application Support path, so these tests exercise the pure
-/// `Data -> Data?` recovery helpers directly — pinning them so a future
+/// fixed Application Support path by default, so these tests use explicit
+/// temporary URLs or pure `Data -> Data?` helpers — pinning them so a future
 /// refactor can't quietly regress the "one bad entry costs only that entry"
 /// guarantee.
 final class PersistenceRecoveryTests: XCTestCase {
+
+    /// Run disk tests in a private temporary directory; body receives state URL; returns no value or throws.
+    private func withTemporaryState(_ body: (URL) throws -> Void) throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("glint-state-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        try body(dir.appendingPathComponent("state.json"))
+    }
+
+    /// Read preserved temporary files; url identifies the state directory; returns their bytes or throws.
+    private func preservedStateBytes(at url: URL) throws -> [Data] {
+        try FileManager.default.contentsOfDirectory(at: url.deletingLastPathComponent(), includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent != "state.json" }
+            .map {
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: $0.path)
+                return try Data(contentsOf: $0)
+            }
+    }
+
+    /// Preserve an unreadable original before fresh state is saved; no inputs; returns no value and asserts both snapshots survive.
+    func testUnreadableStateIsPreservedBeforeSave() throws {
+        try withTemporaryState { url in
+            let original = try stateData(workspaces: [Workspace.fresh(name: "Original", accentHex: "5E5CE6", symbol: "O")])
+            try original.write(to: url)
+            try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: url.path)
+            XCTAssertNil(Persistence.load(from: url))
+            let replacement = PersistedState.fresh
+            Persistence.save(replacement, to: url)
+            XCTAssertTrue(try preservedStateBytes(at: url).contains(original))
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            XCTAssertNotNil(try JSONDecoder().decode(PersistedState.self, from: Data(contentsOf: url)))
+        }
+    }
+
+    /// Retry a failed preservation when directory access recovers; no inputs; returns no value and asserts originals remain protected.
+    func testUnreadableBackupFailureCanRecoverOnLaterSave() throws {
+        try withTemporaryState { url in
+            let original = try stateData(workspaces: [Workspace.fresh(name: "Original", accentHex: "5E5CE6", symbol: "O")])
+            try original.write(to: url)
+            try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: url.path)
+            let parent = url.deletingLastPathComponent()
+            try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: parent.path)
+            XCTAssertNil(Persistence.load(from: url))
+            Persistence.save(.fresh, to: url)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            XCTAssertEqual(try Data(contentsOf: url), original)
+            Persistence.save(.fresh, to: url)
+            XCTAssertTrue(try preservedStateBytes(at: url).contains(original))
+            XCTAssertNotNil(Persistence.load(from: url))
+        }
+    }
+
+    /// Retry failed corrupt-file quarantine after permissions recover; no inputs; returns no value and asserts saving resumes safely.
+    func testCorruptBackupFailureCanRecoverOnLaterSave() throws {
+        try withTemporaryState { url in
+            let original = Data("not-json".utf8)
+            try original.write(to: url)
+            let parent = url.deletingLastPathComponent()
+            try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: parent.path)
+            XCTAssertNil(Persistence.load(from: url))
+            Persistence.save(.fresh, to: url)
+            XCTAssertEqual(try Data(contentsOf: url), original)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
+            Persistence.save(.fresh, to: url)
+            XCTAssertTrue(try preservedStateBytes(at: url).contains(original))
+            XCTAssertNotNil(Persistence.load(from: url))
+        }
+    }
+
+    /// Allow fresh installations to save; no inputs; returns no value and asserts missing files create no quarantine.
+    func testMissingStateAllowsSaveWithoutBackup() throws {
+        try withTemporaryState { url in
+            XCTAssertNil(Persistence.load(from: url))
+            Persistence.save(.fresh, to: url)
+            XCTAssertNotNil(Persistence.load(from: url))
+            XCTAssertTrue(try preservedStateBytes(at: url).isEmpty)
+        }
+    }
+
+    /// Preserve an existing link whose target is temporarily missing; no inputs; returns no value and asserts the link survives in backup.
+    func testDanglingStateSymlinkIsPreserved() throws {
+        try withTemporaryState { url in
+            let target = url.deletingLastPathComponent().appendingPathComponent("temporarily-unavailable.json")
+            try FileManager.default.createSymbolicLink(at: url, withDestinationURL: target)
+            XCTAssertNil(Persistence.load(from: url))
+            Persistence.save(.fresh, to: url)
+            let backups = try FileManager.default.contentsOfDirectory(at: url.deletingLastPathComponent(), includingPropertiesForKeys: nil)
+                .filter { $0.lastPathComponent.hasPrefix("state.json.corrupt-") }
+            XCTAssertEqual(backups.count, 1)
+            if let backup = backups.first {
+                XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: backup.path), target.path)
+            }
+            XCTAssertNotNil(Persistence.load(from: url))
+        }
+    }
 
     /// Encode a fixture without disk access; workspaces and selection are inputs; returns JSON data.
     private func stateData(workspaces: [Workspace], selectedWorkspaceID: UUID? = nil) throws -> Data {

@@ -23,6 +23,9 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
+      - name: Verify dependency lock
+        run: node scripts/verify-dependency-lock.mjs
+
       - name: Resolve ghostty SHA
         id: ghostty
         run: |
@@ -51,6 +54,8 @@ jobs:
             -scheme Glint \
             -configuration Debug \
             -derivedDataPath build \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
@@ -60,11 +65,15 @@ jobs:
 
           scripts/verify-ghostty-resources.sh build/Build/Products/Debug/Glint.app
 
-      - name: Test Web Remote browser input
+      - name: Test Web Remote browser input and outbound queues
         run: node --test scripts/test-web-remote-*.mjs
 
-      - name: Test Git and persistence regressions
-        run: node --test scripts/test-git-review.mjs scripts/test-persistence-recovery.mjs
+      - name: Test native logic regressions
+        run: >-
+          node --test scripts/test-git-review.mjs scripts/test-git-untracked.mjs
+          scripts/test-persistence-recovery.mjs scripts/test-workspace-lifecycle.mjs
+          scripts/test-control-lifecycle.mjs scripts/test-usage-refresh.mjs
+          scripts/test-http-lifecycle.mjs scripts/test-web-file-admission.mjs
 
       - name: Test Glint
         run: |
@@ -74,6 +83,8 @@ jobs:
             -scheme GlintTests \
             -configuration Debug \
             -derivedDataPath build \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \

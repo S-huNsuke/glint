@@ -83,20 +83,37 @@ struct WebRemoteOutboundBuffer {
     }
 
     let maxQueuedOutputBytes: Int
+    let maxQueuedBytes: Int
+    let maxQueuedItems: Int
     private var items: [Item] = []
     private var queuedOutputBytes = 0
+    private var queuedBytes = 0
 
-    init(maxQueuedOutputBytes: Int) {
+    /// Set stream, total-byte and item budgets; returns an empty response queue.
+    /// The total allows a 5 MiB image after base64/JSON encoding and snapshots.
+    init(maxQueuedOutputBytes: Int, maxQueuedBytes: Int = 16 * 1024 * 1024,
+         maxQueuedItems: Int = 256) {
         precondition(maxQueuedOutputBytes >= 0)
+        precondition(maxQueuedBytes >= 0 && maxQueuedItems > 0)
         self.maxQueuedOutputBytes = maxQueuedOutputBytes
+        self.maxQueuedBytes = maxQueuedBytes
+        self.maxQueuedItems = maxQueuedItems
     }
 
-    mutating func enqueueMessage(_ data: Data) {
+    /// Queue a JSON response; data is its encoded body; returns false at capacity.
+    @discardableResult
+    mutating func enqueueMessage(_ data: Data) -> Bool {
+        guard data.count <= maxQueuedBytes - queuedBytes,
+              items.count < maxQueuedItems else { return false }
         items.append(.message(data))
+        queuedBytes += data.count
+        return true
     }
 
+    /// Queue terminal bytes for a pane; returns false when either budget is full.
     mutating func enqueueTerminalOutput(_ data: Data, pane: String) -> Bool {
-        guard data.count <= maxQueuedOutputBytes - queuedOutputBytes else { return false }
+        guard data.count <= maxQueuedOutputBytes - queuedOutputBytes,
+              data.count <= maxQueuedBytes - queuedBytes else { return false }
         if let last = items.last,
            case let .terminalOutput(existingPane, existingData) = last,
            existingPane == pane {
@@ -107,24 +124,33 @@ struct WebRemoteOutboundBuffer {
                 data: combined
             )
         } else {
+            guard items.count < maxQueuedItems else { return false }
             items.append(.terminalOutput(pane: pane, data: data))
         }
         queuedOutputBytes += data.count
+        queuedBytes += data.count
         return true
     }
 
+    /// Remove the next response and release its budget; no parameters; returns nil if empty.
     mutating func next() -> Item? {
         guard !items.isEmpty else { return nil }
         let item = items.removeFirst()
-        if case let .terminalOutput(_, data) = item {
+        switch item {
+        case let .terminalOutput(_, data):
             queuedOutputBytes -= data.count
+            queuedBytes -= data.count
+        case let .message(data):
+            queuedBytes -= data.count
         }
         return item
     }
 
+    /// Clear queued responses and all accounting; no parameters or return value.
     mutating func removeAll() {
         items.removeAll()
         queuedOutputBytes = 0
+        queuedBytes = 0
     }
 }
 
@@ -168,6 +194,7 @@ final class WebRemoteServer: @unchecked Sendable {
 
     static let maxClientConnections = 32
     static let maxUnauthenticatedConnections = 8
+    static let maxHTTPConnections = 32
     private static let maxIngressOutputBytes = 256 * 1024
     private static let maxSelectionOutputBytes = 512 * 1024
     private static let authFailureCountCap = 7
@@ -228,6 +255,9 @@ final class WebRemoteServer: @unchecked Sendable {
     private var httpListener: NWListener?
     private var webSocketListener: NWListener?
     private var clients: [UUID: WebRemoteClientConnection] = [:]
+    private var httpConnections: [ObjectIdentifier: NWConnection] = [:]
+    private var activeFileRequests: [UUID: UUID] = [:]
+    private let httpRequestTimeout: TimeInterval
     private var authThrottle = WebRemoteAuthThrottle(
         countCap: WebRemoteServer.authFailureCountCap,
         expirySeconds: WebRemoteServer.authFailureExpirySeconds
@@ -255,10 +285,12 @@ final class WebRemoteServer: @unchecked Sendable {
     init(
         defaults: UserDefaults = .standard,
         interfaceRetryInterval: TimeInterval = 5,
+        httpRequestTimeout: TimeInterval = 10,
         resolveBindAddress: @escaping (String) -> String? = WebRemoteListenTarget.bindAddress
     ) {
         self.defaults = defaults
         self.interfaceRetryInterval = interfaceRetryInterval
+        self.httpRequestTimeout = httpRequestTimeout
         self.resolveBindAddress = resolveBindAddress
         ports = WebRemotePortStore.loadOrCreate(defaults: defaults)
     }
@@ -449,7 +481,8 @@ final class WebRemoteServer: @unchecked Sendable {
             configure(http, kind: .http, runID: currentRun)
             configure(webSocket, kind: .webSocket, runID: currentRun)
             http.newConnectionHandler = { [weak self] connection in
-                self?.handleHTTPConnection(connection)
+                guard let self else { connection.cancel(); return }
+                self.handleHTTPConnection(connection, runID: currentRun)
             }
             webSocket.newConnectionHandler = { [weak self] connection in
                 self?.handleWebSocketConnection(connection)
@@ -607,6 +640,11 @@ final class WebRemoteServer: @unchecked Sendable {
         webSocketListener = nil
         clients.values.forEach { $0.cancel() }
         clients.removeAll()
+        for connection in httpConnections.values {
+            connection.stateUpdateHandler = nil
+            connection.cancel()
+        }
+        httpConnections.removeAll()
         authThrottle.removeAll()
         readyListeners.removeAll()
         token = ""
@@ -642,28 +680,51 @@ final class WebRemoteServer: @unchecked Sendable {
         }
     }
 
-    private func handleHTTPConnection(_ connection: NWConnection) {
+    /// Track a connection for this listener generation; returns nothing. The
+    /// fixed deadline includes header receipt and response completion, so slow
+    /// readers cannot keep a slot indefinitely after submitting their headers.
+    private func handleHTTPConnection(_ connection: NWConnection, runID: UUID) {
+        guard self.runID == runID, httpConnections.count < Self.maxHTTPConnections else {
+            connection.cancel()
+            return
+        }
+        let id = ObjectIdentifier(connection)
+        httpConnections[id] = connection
         connection.stateUpdateHandler = { [weak self, weak connection] state in
-            guard let self, let connection else { return }
+            guard let self, let connection, self.httpConnections[id] === connection else { return }
             switch state {
             case .ready:
                 self.receiveHTTPRequest(connection, buffer: Data())
             case .failed,
                  .cancelled:
-                connection.stateUpdateHandler = nil
+                self.finishHTTPConnection(connection)
             default:
                 break
             }
         }
         connection.start(queue: queue)
+        queue.asyncAfter(deadline: .now() + httpRequestTimeout) { [weak self, weak connection] in
+            guard let self, let connection, self.httpConnections[id] === connection else { return }
+            self.finishHTTPConnection(connection)
+        }
     }
 
+    /// Remove and cancel a tracked HTTP connection; no return value.
+    private func finishHTTPConnection(_ connection: NWConnection) {
+        httpConnections.removeValue(forKey: ObjectIdentifier(connection))
+        connection.stateUpdateHandler = nil
+        connection.cancel()
+    }
+
+    /// Receive bounded headers for a tracked connection; buffer is accumulated
+    /// header data. Returns nothing and stops on completion, failure or deadline.
     private func receiveHTTPRequest(_ connection: NWConnection, buffer: Data) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) {
             [weak self, weak connection] content, _, complete, error in
-            guard let self, let connection else { return }
+            guard let self, let connection,
+                  self.httpConnections[ObjectIdentifier(connection)] === connection else { return }
             if error != nil {
-                connection.cancel()
+                self.finishHTTPConnection(connection)
                 return
             }
             var next = buffer
@@ -731,9 +792,11 @@ final class WebRemoteServer: @unchecked Sendable {
         sendHTTP(response, to: connection)
     }
 
+    /// Send a response body and release its tracked connection; returns nothing.
     private func sendHTTP(_ data: Data, to connection: NWConnection) {
-        connection.send(content: data, completion: .contentProcessed { _ in
-            connection.cancel()
+        connection.send(content: data, completion: .contentProcessed { [weak self, weak connection] _ in
+            guard let self, let connection else { return }
+            self.finishHTTPConnection(connection)
         })
     }
 
@@ -1097,56 +1160,83 @@ final class WebRemoteServer: @unchecked Sendable {
         }
     }
 
+    /// Read/list files for a live client; inputs identify its request. Returns
+    /// nothing. Keep tickets until I/O finishes, even across stop/restart, so
+    /// toggling the server cannot bypass the global background-work budget.
     private func accessFiles(_ request: WebRemoteFileRequest, clientID: UUID) {
+        guard clients[clientID] != nil else { return }
+        guard activeFileRequests.count < 8,
+              activeFileRequests.values.filter({ $0 == clientID }).count < 2 else {
+            dropClientLocked(clientID, reason: "file request limit reached")
+            return
+        }
+        let ticket = UUID()
+        activeFileRequests[ticket] = clientID
         DispatchQueue.main.async { [weak self] in
-            guard let self, let store = WorkspaceStore.current else { return }
+            guard let self else { return }
+            guard let store = WorkspaceStore.current else {
+                self.queue.async { self.activeFileRequests.removeValue(forKey: ticket) }
+                return
+            }
             let currentRoot = store.webRemoteFileRoot(workspace: request.workspace, pane: request.pane)
             guard case let .success(root) = request.validatedRoot(current: currentRoot) else {
                 let error: WebRemoteFiles.ErrorCode = currentRoot == nil ? .rootUnavailable : .rootChanged
-                self.queue.async { [weak self] in self?.sendJSON(request.error(error), to: clientID) }
+                self.queue.async {
+                    self.activeFileRequests.removeValue(forKey: ticket)
+                    self.sendJSON(request.error(error), to: clientID)
+                }
                 return
             }
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                var response: [String: Any] = [
-                    "workspace": request.workspace.uuidString, "pane": request.pane,
-                    "path": request.path, "root": root, "request": request.requestID,
-                ]
-                if request.read {
-                    if WebRemoteFiles.isImage(request.path) {
-                        switch WebRemoteFiles.readImage(root: root, path: request.path) {
-                        case let .success(png):
-                            response["type"] = "fileImage"
-                            response["data"] = png.base64EncodedString()
-                        case let .failure(error): response = request.error(error)
+            self.queue.async { [self] in
+                guard self.clients[clientID] != nil else {
+                    self.activeFileRequests.removeValue(forKey: ticket)
+                    return
+                }
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    var response: [String: Any] = [
+                        "workspace": request.workspace.uuidString, "pane": request.pane,
+                        "path": request.path, "root": root, "request": request.requestID,
+                    ]
+                    if request.read {
+                        if WebRemoteFiles.isImage(request.path) {
+                            switch WebRemoteFiles.readImage(root: root, path: request.path) {
+                            case let .success(png):
+                                response["type"] = "fileImage"
+                                response["data"] = png.base64EncodedString()
+                            case let .failure(error): response = request.error(error)
+                            }
+                        } else {
+                            switch WebRemoteFiles.read(root: root, path: request.path) {
+                            case let .success(content):
+                                response["type"] = "fileContent"
+                                response["content"] = content
+                                response["format"] = WebRemoteFiles.isHTML(request.path) ? "html" : "text"
+                            case let .failure(error): response = request.error(error)
+                            }
                         }
                     } else {
-                        switch WebRemoteFiles.read(root: root, path: request.path) {
-                        case let .success(content):
-                            response["type"] = "fileContent"
-                            response["content"] = content
-                            response["format"] = WebRemoteFiles.isHTML(request.path) ? "html" : "text"
+                        switch WebRemoteFiles.list(root: root, path: request.path) {
+                        case let .success(entries):
+                            response["type"] = "fileList"
+                            response["entries"] = entries
+                            response["limit"] = WebRemoteFiles.maxEntries
                         case let .failure(error): response = request.error(error)
                         }
                     }
-                } else {
-                    switch WebRemoteFiles.list(root: root, path: request.path) {
-                    case let .success(entries):
-                        response["type"] = "fileList"
-                        response["entries"] = entries
-                        response["limit"] = WebRemoteFiles.maxEntries
-                    case let .failure(error): response = request.error(error)
+                    // I/O can outlive a cd, pane removal, or transition to SSH.
+                    // Revalidate before handing the result back to the browser.
+                    let completedResponse = response
+                    DispatchQueue.main.async { [weak self] in
+                        let latest = WorkspaceStore.current?.webRemoteFileRoot(
+                            workspace: request.workspace, pane: request.pane
+                        )
+                        let checkedResponse = latest == root ? completedResponse
+                            : request.error(latest == nil ? .rootUnavailable : .rootChanged)
+                        self?.queue.async { [weak self] in
+                            self?.activeFileRequests.removeValue(forKey: ticket)
+                            self?.sendJSON(checkedResponse, to: clientID)
+                        }
                     }
-                }
-                // I/O can outlive a cd, pane removal, or transition to SSH.
-                // Revalidate before handing the result back to the browser.
-                let completedResponse = response
-                DispatchQueue.main.async { [weak self] in
-                    let latest = WorkspaceStore.current?.webRemoteFileRoot(
-                        workspace: request.workspace, pane: request.pane
-                    )
-                    let checkedResponse = latest == root ? completedResponse
-                        : request.error(latest == nil ? .rootUnavailable : .rootChanged)
-                    self?.queue.async { [weak self] in self?.sendJSON(checkedResponse, to: clientID) }
                 }
             }
         }
@@ -1401,7 +1491,10 @@ private final class WebRemoteClientConnection: @unchecked Sendable {
 
     func send(_ data: Data) {
         guard !cancelled else { return }
-        outbound.enqueueMessage(data)
+        guard outbound.enqueueMessage(data) else {
+            cancel()
+            return
+        }
         sendNextIfNeeded()
     }
 

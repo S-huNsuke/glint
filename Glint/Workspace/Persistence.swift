@@ -58,9 +58,9 @@ enum Persistence {
         return FileManager.default.fileExists(atPath: url.path)
     }
 
-    /// Path of a corrupt state.json that we could NOT move aside (disk full,
-    /// permissions). save() refuses to write over it so the only copy of the
-    /// user's data is never clobbered. Session-scoped: cleared on next launch.
+    /// Path of an unreadable/corrupt state.json we could not preserve. A later
+    /// save retries preservation before writing, so recovered permissions or
+    /// disk space allow saving again without sacrificing the original.
     private static var corruptUnmovablePath: String?
 
     /// Returns nil both for "no saved state" (fresh install) and "state was
@@ -68,10 +68,28 @@ enum Persistence {
     /// file is moved aside (never deleted or overwritten) so a decode bug or
     /// half-written file can't silently destroy the user's workspaces. Before
     /// quarantining we try to surgically strip a single bad pane entry so it
-    /// costs only that pane, not every workspace.
+    /// costs only that pane, not every workspace. Takes no parameters; returns
+    /// the restored snapshot or nil when a fresh in-memory state is needed.
     static func load() -> PersistedState? {
         guard let url = fileURL else { return nil }
-        guard let data = try? Data(contentsOf: url) else { return nil }
+        return load(from: url)
+    }
+
+    /// Load a saved snapshot; url is its disk location; returns decoded state or nil on missing/unreadable data.
+    static func load(from url: URL) -> PersistedState? {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            let failure = error as NSError
+            if failure.domain != NSCocoaErrorDomain || failure.code != NSFileReadNoSuchFileError {
+                NSLog("[glint] couldn't read \(fileName): \(error); preserving the original before starting fresh")
+            }
+            // A missing target can still leave a real symlink at state.json;
+            // only the move's missing-source result proves nothing needs saving.
+            _ = preserveOriginal(at: url)
+            return nil
+        }
         do {
             return try JSONDecoder().decode(PersistedState.self, from: data)
         } catch {
@@ -109,29 +127,43 @@ enum Persistence {
                 return state
             }
 
-            let stamp = Int(Date().timeIntervalSince1970)
-            let backup = url.deletingLastPathComponent()
-                .appendingPathComponent("\(fileName).corrupt-\(stamp)")
-            do {
-                try FileManager.default.moveItem(at: url, to: backup)
-                NSLog("[glint] failed to decode \(fileName): \(error); moved it aside to \(backup.lastPathComponent) and starting fresh")
-            } catch {
-                // Couldn't move it aside either — remember the path so save()
-                // won't overwrite the only copy. The original stays put for
-                // the user to recover manually; we start fresh in memory.
-                corruptUnmovablePath = url.path
-                NSLog("[glint] \(fileName) couldn't be moved aside to \(backup.lastPathComponent); refusing to overwrite — original kept at \(url.path), starting fresh")
-            }
+            NSLog("[glint] failed to decode \(fileName): \(error); preserving it before starting fresh")
+            _ = preserveOriginal(at: url)
             return nil
         }
     }
 
+    /// Move an unreadable original to a unique sibling; url is its location; returns whether saving may safely proceed.
+    private static func preserveOriginal(at url: URL) -> Bool {
+        let backup = url.deletingLastPathComponent()
+            .appendingPathComponent("\(fileName).corrupt-\(UUID().uuidString)")
+        do {
+            try FileManager.default.moveItem(at: url, to: backup)
+            if corruptUnmovablePath == url.path { corruptUnmovablePath = nil }
+            NSLog("[glint] preserved \(fileName) at \(backup.lastPathComponent)")
+            return true
+        } catch {
+            let failure = error as NSError
+            if failure.domain == NSCocoaErrorDomain,
+               failure.code == NSFileNoSuchFileError || failure.code == NSFileReadNoSuchFileError {
+                if corruptUnmovablePath == url.path { corruptUnmovablePath = nil }
+                return true
+            }
+            corruptUnmovablePath = url.path
+            NSLog("[glint] couldn't preserve \(fileName) (\(error)); refusing to overwrite the original")
+            return false
+        }
+    }
+
+    /// Save the snapshot to the application path; state is the current model; returns no value.
     static func save(_ state: PersistedState) {
         guard let url = fileURL else { return }
-        if corruptUnmovablePath == url.path {
-            NSLog("[glint] skipping save: \(fileName) is the corrupt file we couldn't move aside; not overwriting the user's data")
-            return
-        }
+        save(state, to: url)
+    }
+
+    /// Save a snapshot; state and destination url are inputs; returns no value, preserving unreadable originals.
+    static func save(_ state: PersistedState, to url: URL) {
+        if corruptUnmovablePath == url.path, !preserveOriginal(at: url) { return }
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         do {

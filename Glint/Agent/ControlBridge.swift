@@ -25,13 +25,18 @@ final class ControlBridge {
     private(set) var socketPath: String = ""
     private(set) var tokenPath: String = ""
     private var token: String = ""
+    private let lifecycleLock = NSLock()
+    private var generation: UUID?
+    private var acceptedClients: Set<Int32> = []
     private var listenFD: Int32 = -1
     private var acceptSource: DispatchSourceRead?
     private let queue = DispatchQueue(label: "glint.control.bridge", qos: .utility)
-    /// Whether the listener is currently bound. Guards double-start and makes
-    /// stop() a no-op when already off. Mutated only on the main thread (from
-    /// the externalControlEnabled toggle / app launch).
-    private(set) var isRunning = false
+    /// Lifecycle mutations run on main; accept/serve readers use the same lock.
+    var isRunning: Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return generation != nil
+    }
 
     private init() {}
 
@@ -53,6 +58,7 @@ final class ControlBridge {
     /// Bind + listen on `~/.glint/run/control.sock` (Debug: `control-debug.sock`).
     /// Same 0700-parent / 0600-socket discipline as `AgentBridge` — see its
     /// `start()` for the rationale on why a private parent dir matters here.
+    /// Takes no parameters; returns nothing and stays stopped on bind failure.
     func start() {
         guard !isRunning else { return }
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -115,25 +121,35 @@ final class ControlBridge {
             return
         }
 
+        // A cancelled source can have a queued handler. Nonblocking accept
+        // plus the lifecycle lock prevents that handler accepting a reused FD.
+        _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+        lifecycleLock.lock()
         listenFD = fd
+        generation = UUID()
+        lifecycleLock.unlock()
         let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         src.setEventHandler { [weak self] in self?.acceptOne() }
+        src.setCancelHandler { close(fd) }
         src.resume()
         acceptSource = src
-        isRunning = true
         NSLog("[glint] control bridge listening on \(path)")
     }
 
     /// Stop listening and remove the socket + token so the
     /// externalControlEnabled toggle can revoke access live — no app restart.
-    /// Safe when already stopped. Connections already accepted finish on their
-    /// own; no new ones are accepted.
+    /// No parameters; returns nothing. Accepted connections are shut down;
+    /// their serving tasks retain ownership of close() to prevent FD reuse.
     func stop() {
-        guard isRunning else { return }
-        isRunning = false
+        lifecycleLock.lock()
+        guard generation != nil else { lifecycleLock.unlock(); return }
+        generation = nil
+        token = ""
+        listenFD = -1
+        for fd in acceptedClients { _ = shutdown(fd, SHUT_RDWR) }
+        lifecycleLock.unlock()
         acceptSource?.cancel()
         acceptSource = nil
-        if listenFD >= 0 { close(listenFD); listenFD = -1 }
         if !socketPath.isEmpty { unlink(socketPath) }
         // Drop the token too — a fresh one is minted on the next start(), so a
         // stale on-disk token can't authorize anything while we're off.
@@ -171,9 +187,10 @@ final class ControlBridge {
         chmod(path, 0o600)
     }
 
-    /// Constant-time compare — no early return on first mismatch.
+    /// Compare a supplied token on main immediately before execution; returns
+    /// whether it matches the nonempty live token without early byte exits.
     private func tokenMatches(_ provided: String?) -> Bool {
-        guard let provided else { return false }
+        guard let provided, !token.isEmpty else { return false }
         let a = Array(provided.utf8)
         let b = Array(token.utf8)
         var diff = UInt8(a.count == b.count ? 0 : 1)
@@ -188,19 +205,35 @@ final class ControlBridge {
 
     // MARK: accept / serve
 
+    /// Accept a client for the current generation; no inputs or return value.
     private func acceptOne() {
+        lifecycleLock.lock()
+        guard let run = generation, listenFD >= 0 else { lifecycleLock.unlock(); return }
         let client = accept(listenFD, nil, nil)
-        guard client >= 0 else { return }
+        guard client >= 0 else { lifecycleLock.unlock(); return }
+        _ = fcntl(client, F_SETFL, fcntl(client, F_GETFL) & ~O_NONBLOCK)
+        acceptedClients.insert(client)
+        lifecycleLock.unlock()
         var tv = timeval(tv_sec: 5, tv_usec: 0)
         _ = setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        DispatchQueue.global(qos: .utility).async { [weak self] in self?.serve(fd: client) }
+        _ = setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var noPipe: Int32 = 1
+        _ = setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noPipe, socklen_t(MemoryLayout<Int32>.size))
+        DispatchQueue.global(qos: .utility).async { self.serve(fd: client, generation: run) }
     }
 
     /// Runs off the accept queue. Each request line is parsed here, dispatched
     /// onto the main queue (where the store + surfaces live), and the response
     /// line written straight back on this connection.
-    private func serve(fd: Int32) {
-        defer { close(fd) }
+    /// Parameters: owned client descriptor and accepting generation. Returns
+    /// nothing; closes its descriptor after EOF, shutdown, timeout or failure.
+    private func serve(fd: Int32, generation: UUID) {
+        defer {
+            lifecycleLock.lock()
+            acceptedClients.remove(fd)
+            close(fd)
+            lifecycleLock.unlock()
+        }
         var buf = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)
         while true {
@@ -212,7 +245,7 @@ final class ControlBridge {
             while let nl = buf.firstIndex(of: 0x0A) {
                 let line = buf.subdata(in: buf.startIndex..<nl)
                 buf.removeSubrange(buf.startIndex...nl)
-                var resp = handle(line: line)
+                var resp = handle(line: line, generation: generation)
                 resp.append(0x0A)
                 resp.withUnsafeBytes { raw in
                     _ = Darwin.write(fd, raw.baseAddress, raw.count)
@@ -222,22 +255,28 @@ final class ControlBridge {
         }
     }
 
-    private func handle(line: Data) -> Data {
+    /// Handle a request from one accepting generation; returns a JSON response.
+    /// The main-thread gate orders revocation before all queued store actions.
+    private func handle(line: Data, generation: UUID) -> Data {
         guard let obj = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
               let cmd = obj["cmd"] as? String else {
             return Self.errorResponse("bad-request")
         }
 
-        // Command-level gating: send-* mutate the terminal, so they require a
-        // token; focus/list don't (see §4.4). Auth is checked off the main
-        // thread — it's a pure comparison.
-        let requiresToken = (cmd == "send-text" || cmd == "send-key")
-        if requiresToken && !tokenMatches(obj["token"] as? String) {
-            return Self.errorResponse("unauthorized")
-        }
-
         var response = Self.errorResponse("unknown-cmd")
         DispatchQueue.main.sync {
+            self.lifecycleLock.lock()
+            let active = self.generation == generation
+            self.lifecycleLock.unlock()
+            guard active else {
+                response = Self.errorResponse("unauthorized")
+                return
+            }
+            let requiresToken = (cmd == "send-text" || cmd == "send-key")
+            guard !requiresToken || self.tokenMatches(obj["token"] as? String) else {
+                response = Self.errorResponse("unauthorized")
+                return
+            }
             guard let store = WorkspaceStore.current else {
                 response = Self.errorResponse("bad-request")
                 return

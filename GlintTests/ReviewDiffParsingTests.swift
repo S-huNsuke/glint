@@ -29,6 +29,53 @@ final class ReviewDiffParsingTests: XCTestCase {
         }
     }
 
+    private struct FailedDiffRunner: GitRunner {
+        let failAt: String
+
+        /// Simulate one failed Git step. Parameters: argv, cwd, timeout. Returns fixture output or failure.
+        func run(_ args: [String], cwd: String?, timeout: GitTimeout) async throws -> GitResult {
+            if args.contains(failAt) {
+                return GitResult(exitCode: 128, stdout: "", stderr: "fixture failure")
+            }
+            return try await NonLocalDiffRunner().run(args, cwd: cwd, timeout: timeout)
+        }
+
+        /// Supply empty untracked counts. Parameters: repository and paths. Returns an empty map.
+        func countUntrackedAdditions(repo: String, paths: [String]) async -> [String: Int] { [:] }
+    }
+
+    /// Reject partial file lists. Parameters: none. Returns nothing; asserts errors from every list step.
+    func testChangedFilesThrowsForFailedGitRead() async {
+        for step in ["--name-status", "--numstat", "ls-files"] {
+            do {
+                _ = try await GitService(runner: FailedDiffRunner(failAt: step))
+                    .changedFiles(repo: "/unused", scope: .workingTree)
+                XCTFail("Expected Git failure for \(step)")
+            } catch { }
+        }
+    }
+
+    /// Expose Git failures in Review rather than empty content. Parameters: none. Returns nothing; asserts model state.
+    @MainActor
+    func testReviewPublishesListAndDiffErrors() async {
+        let model = ReviewModel(repo: "/unused", title: "Test", scopes: [.workingTree],
+                                runner: FailedDiffRunner(failAt: "--name-status"))
+        model.files = [file("stale.txt")]
+        model.selected = model.files.first
+        await model.reload()
+        XCTAssertNotNil(model.filesError)
+        XCTAssertTrue(model.files.isEmpty)
+        XCTAssertNil(model.selected)
+        XCTAssertFalse(model.loadingFiles)
+
+        let diffModel = ReviewModel(repo: "/unused", title: "Test", scopes: [.workingTree],
+                                    runner: FailedDiffRunner(failAt: "--unified=1000000"))
+        await diffModel.select(file("file.txt"))
+        XCTAssertNotNil(diffModel.diffError)
+        XCTAssertTrue(diffModel.diffText.isEmpty)
+        XCTAssertFalse(diffModel.loadingDiff)
+    }
+
     /// Preserve literal path bytes in NUL records. Parameters: none. Returns nothing; asserts counts and kinds.
     func testMergeNulRecordsPreservesSpecialFilenames() {
         let paths = ["中文.txt", "tab\tfile.txt", "line\nfile.txt", "quote\"file.txt"]
@@ -269,7 +316,7 @@ rename to n
         defer { try? FileManager.default.removeItem(at: repo) }
         try Data("local collision".utf8).write(to: repo.appendingPathComponent("file.txt"))
 
-        let files = await GitService(runner: NonLocalDiffRunner())
+        let files = try await GitService(runner: NonLocalDiffRunner())
             .changedFiles(repo: repo.path, scope: .workingTree)
 
         XCTAssertEqual(files.count, 1)
