@@ -14,9 +14,24 @@ const homesSource = fs.readFileSync(path.join(root, "Glint/Agent/CodexHome.swift
 const homeEnd = homesSource.indexOf("@MainActor\nfinal class CodexHomeStore:");
 assert.ok(homeEnd > 0, "CodexHome extraction markers changed");
 
+/** Keep a real reader declaration while replacing its body; input identifies reader and probe; returns a safe Swift enum. */
+function probeReader({ type, method, body, documentation }) {
+  const enumStart = source.indexOf(`enum ${type} {`);
+  assert.ok(enumStart >= 0, `Missing reader ${type}`);
+  const declarationStart = source.indexOf(`    static func ${method}(`, enumStart);
+  const bodyStart = source.indexOf("{", declarationStart);
+  assert.ok(declarationStart > enumStart && bodyStart > declarationStart, `Missing declaration ${type}.${method}`);
+  const declaration = source.slice(declarationStart, bodyStart).trimEnd();
+  assert.match(declaration, /\)\s+async\s+->\s+AgentQuota\?$/,
+    `Unexpected return contract for ${type}.${method}`);
+  return `enum ${type} {\n    /// ${documentation}\n${declaration} {\n        ${body}\n    }\n}\n`;
+}
+
 // Compile the shipped store and data models, replacing only platform wrappers,
 // settings persistence and external readers. Every request suspends on a test
 // continuation; this runner never opens auth files, keychains, hooks or sockets.
+// Reader argument labels, types and defaults are copied from production so an
+// invalid function reference cannot compile merely because a stub lost inputs.
 const stubs = `import Foundation
 protocol ObservableObject {}
 @propertyWrapper struct Published<Value> {
@@ -51,20 +66,12 @@ enum CodexLiveReader {
     /// Avoid credential access; input is a home URL; returns a placeholder.
     static func authStatus(from home: URL) -> CodexAuthStatus { .found }
 }
-enum CodexUsageReader {
-    /// Suspend a test quota request; input is its home; returns the injected quota.
-    static func readPreferLive(from home: URL) async -> AgentQuota? {
-        await Probe.shared.read(home.path)
-    }
-}
-enum ClaudeUsageReader {
-    /// Suspend a test quota request; takes no inputs; returns the injected quota.
-    static func read() async -> AgentQuota? { await Probe.shared.read("claude") }
-}
-enum GrokUsageReader {
-    /// Suspend a test quota request; takes no inputs; returns the injected quota.
-    static func read() async -> AgentQuota? { await Probe.shared.read("grok") }
-}
+${probeReader({ type: "CodexUsageReader", method: "readPreferLive", body: "await Probe.shared.read(codexHome.path)",
+  documentation: "Suspend a test quota request; input is its home; returns the injected quota." })}
+${probeReader({ type: "ClaudeUsageReader", method: "read", body: 'await Probe.shared.read("claude")',
+  documentation: "Suspend a test quota request; takes no inputs; returns the injected quota." })}
+${probeReader({ type: "GrokUsageReader", method: "read", body: 'await Probe.shared.read("grok")',
+  documentation: "Suspend a test quota request; input is its optional home; returns the injected quota." })}
 actor Probe {
     static let shared = Probe()
     private var counts: [String: Int] = [:]

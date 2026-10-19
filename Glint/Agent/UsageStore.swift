@@ -258,7 +258,7 @@ final class UsageStore: ObservableObject {
             refreshAgent(.claude, read: ClaudeUsageReader.read)
         }
         if grokEnabled {
-            refreshAgent(.grok, read: GrokUsageReader.read)
+            refreshAgent(.grok) { await GrokUsageReader.read() }
         }
     }
 
